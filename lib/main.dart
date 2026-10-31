@@ -1,19 +1,21 @@
-import 'dart:convert';
-
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
   runApp(const MyApp());
 }
 
 // ============================================================
-// MODELS (the data, separate from the widgets)
+// MODELS (saved in Firestore under users/{uid}/...)
 // ============================================================
 
 class Course {
   Course({
+    this.id = '',
     required this.name,
     required this.day,
     required this.start,
@@ -21,97 +23,113 @@ class Course {
     this.category = 'Class',
   });
 
-  String name;
-  int day; // 0 = Monday ... 6 = Sunday
-  int start; // minutes since midnight
-  int end;
-  String category;
+  final String id; // the Firestore document id
+  final String name;
+  final int day; // 0 = Monday ... 6 = Sunday
+  final int start; // minutes since midnight
+  final int end;
+  final String category;
 
-  Map<String, dynamic> toJson() {
-    return {
-      'name': name,
-      'day': day,
-      'start': start,
-      'end': end,
-      'category': category,
-    };
-  }
+  Map<String, dynamic> toMap() => {
+    'name': name,
+    'day': day,
+    'start': start,
+    'end': end,
+    'category': category,
+  };
 
-  factory Course.fromJson(Map<String, dynamic> json) {
+  factory Course.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data()!;
     return Course(
-      name: json['name'] as String,
-      day: json['day'] as int,
-      start: json['start'] as int,
-      end: json['end'] as int,
-      category: json['category'] as String,
+      id: doc.id,
+      name: data['name'] as String,
+      day: (data['day'] as num).toInt(),
+      start: (data['start'] as num).toInt(),
+      end: (data['end'] as num).toInt(),
+      category: (data['category'] as String?) ?? 'Class',
     );
   }
 }
 
 class Task {
-  Task({required this.title, this.daily = false, this.doneDate});
+  Task({
+    this.id = '',
+    required this.title,
+    this.daily = false,
+    this.doneDate,
+    this.order = 0,
+  });
 
-  String title;
-  bool daily; // true = comes back every day
-  String? doneDate; // the day it was ticked, e.g. "2026-10-14"
+  final String id;
+  final String title;
+  final bool daily; // true = comes back every day
+  final String? doneDate; // the day it was ticked, e.g. "2026-10-31"
+  final int order; // to keep the list in the order it was created
 
-  Map<String, dynamic> toJson() {
-    return {'title': title, 'daily': daily, 'doneDate': doneDate};
-  }
+  Map<String, dynamic> toMap() => {
+    'title': title,
+    'daily': daily,
+    'doneDate': doneDate,
+    'order': order,
+  };
 
-  factory Task.fromJson(Map<String, dynamic> json) {
+  factory Task.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data()!;
     return Task(
-      title: json['title'] as String,
-      daily: json['daily'] as bool,
-      doneDate: json['doneDate'] as String?,
+      id: doc.id,
+      title: data['title'] as String,
+      daily: (data['daily'] as bool?) ?? false,
+      doneDate: data['doneDate'] as String?,
+      order: ((data['order'] as num?) ?? 0).toInt(),
     );
   }
 }
 
 class Research {
   Research({
+    this.id = '',
     required this.topic,
     required this.detail,
     this.status = 'To find out',
+    this.order = 0,
   });
 
-  String topic;
-  String detail;
-  String status;
+  final String id;
+  final String topic;
+  final String detail;
+  final String status;
+  final int order;
 
-  Map<String, dynamic> toJson() {
-    return {'topic': topic, 'detail': detail, 'status': status};
-  }
+  Map<String, dynamic> toMap() => {
+    'topic': topic,
+    'detail': detail,
+    'status': status,
+    'order': order,
+  };
 
-  factory Research.fromJson(Map<String, dynamic> json) {
+  factory Research.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data()!;
     return Research(
-      topic: json['topic'] as String,
-      detail: json['detail'] as String,
-      status: json['status'] as String,
+      id: doc.id,
+      topic: data['topic'] as String,
+      detail: (data['detail'] as String?) ?? '',
+      status: (data['status'] as String?) ?? 'To find out',
+      order: ((data['order'] as num?) ?? 0).toInt(),
     );
   }
 }
 
-// ============================================================
-// SAVING (Part 2): one key per list, stored as JSON text
-// ============================================================
-
-Future<void> saveList(String key, List<Map<String, dynamic>> list) async {
-  final prefs = await SharedPreferences.getInstance();
-  await prefs.setString(key, jsonEncode(list));
-}
-
-/// Returns the saved list, or null the very first time (nothing saved yet).
-Future<List<Map<String, dynamic>>?> readList(String key) async {
-  final prefs = await SharedPreferences.getInstance();
-  final saved = prefs.getString(key);
-  if (saved == null) return null;
-  final list = jsonDecode(saved) as List;
-  return list.map((x) => x as Map<String, dynamic>).toList();
+/// The signed-in user's collection: users/{uid}/{name}
+CollectionReference<Map<String, dynamic>> userCol(String name) {
+  final uid = FirebaseAuth.instance.currentUser!.uid;
+  return FirebaseFirestore.instance
+      .collection('users')
+      .doc(uid)
+      .collection(name);
 }
 
 // ============================================================
-// LOOKS: colours and icons of each category / status
+// LOOKS
 // ============================================================
 
 final Map<String, Color> categoryColors = {
@@ -158,26 +176,24 @@ const dayNames = [
 /// "08:30" -> 510. Returns null if the text is not a valid HH:MM time.
 int? parseTime(String text) {
   final parts = text.trim().split(':');
-  if (parts.length != 2) return null; // "8h" has no colon
+  if (parts.length != 2) return null;
   if (parts[0].isEmpty || parts[0].length > 2) return null;
-  if (parts[1].length != 2) return null; // minutes need 2 digits
+  if (parts[1].length != 2) return null;
 
   final h = int.tryParse(parts[0]);
   final m = int.tryParse(parts[1]);
-  if (h == null || m == null) return null; // letters instead of numbers
-  if (h < 0 || h > 23 || m < 0 || m > 59) return null; // "25:00", "10:75"
+  if (h == null || m == null) return null;
+  if (h < 0 || h > 23 || m < 0 || m > 59) return null;
 
   return h * 60 + m;
 }
 
-/// 510 -> "08:30"
 String formatTime(int minutes) {
   final h = minutes ~/ 60;
   final m = minutes % 60;
   return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}';
 }
 
-/// 210 -> "3h 30m", 120 -> "2h", 45 -> "45m"
 String formatDuration(int minutes) {
   final h = minutes ~/ 60;
   final m = minutes % 60;
@@ -186,7 +202,6 @@ String formatDuration(int minutes) {
   return '${h}h ${m}m';
 }
 
-/// A text for "today", used to know which tasks are ticked today.
 String todayKey() {
   final n = DateTime.now();
   return '${n.year}-${n.month}-${n.day}';
@@ -196,19 +211,15 @@ String todayKey() {
 // RULES (functions outside build)
 // ============================================================
 
-/// Two blocks clash if they are on the same day and each starts
-/// before the other ends. "<" and not "<=", so 11:00 end and
-/// 11:00 start do NOT clash.
+/// "<" and not "<=": 11:00 end and 11:00 start do NOT clash.
 bool clashes(Course a, Course b) {
   return a.day == b.day && a.start < b.end && b.start < a.end;
 }
 
-/// Every other block that clashes with this one.
 List<Course> clashingWith(Course course, List<Course> all) {
-  return all.where((c) => c != course && clashes(course, c)).toList();
+  return all.where((c) => c.id != course.id && clashes(course, c)).toList();
 }
 
-/// The blocks of one day, sorted by start time.
 List<Course> coursesForDay(int day, List<Course> all) {
   final list = all.where((c) => c.day == day).toList();
   list.sort((a, b) => a.start.compareTo(b.start));
@@ -233,37 +244,47 @@ int classMinutes(List<Course> list) {
   return total;
 }
 
-/// Work yields to class: when a class is added or moved, any work block
-/// that overlaps it is shortened, split or removed. Returns true if
+/// Work yields to class: work blocks that overlap the class are shortened,
+/// split or deleted in Firestore (all in one batch). Returns true if
 /// something changed.
-bool makeRoomForClass(Course cls, List<Course> all) {
+Future<bool> makeRoomForClass(Course cls, List<Course> all) async {
+  final col = userCol('courses');
+  final batch = FirebaseFirestore.instance.batch();
   bool changed = false;
-  for (final w in List<Course>.from(all)) {
+
+  for (final w in all) {
     if (w.category != 'Work' || !clashes(cls, w)) continue;
     changed = true;
+    final ref = col.doc(w.id);
     if (cls.start <= w.start && cls.end >= w.end) {
-      all.remove(w); // the class covers all the work
+      batch.delete(ref); // the class covers all the work
     } else if (cls.start <= w.start) {
-      w.start = cls.end; // the class cuts the beginning of the work
+      batch.update(ref, {'start': cls.end}); // class cuts the beginning
     } else if (cls.end >= w.end) {
-      w.end = cls.start; // the class cuts the end of the work
+      batch.update(ref, {'end': cls.start}); // class cuts the end
     } else {
-      // the class is in the middle: work before + work after
-      all.add(Course(
-        name: w.name,
-        category: 'Work',
-        day: w.day,
-        start: cls.end,
-        end: w.end,
-      ));
-      w.end = cls.start;
+      // class in the middle: work before + a new work block after
+      batch.update(ref, {'end': cls.start});
+      batch.set(
+        col.doc(),
+        Course(
+          name: w.name,
+          category: 'Work',
+          day: w.day,
+          start: cls.end,
+          end: w.end,
+        ).toMap(),
+      );
     }
+  }
+
+  if (changed) {
+    await batch.commit();
   }
   return changed;
 }
 
-/// 0 or 1: which half of its column a clashing block takes in the grid,
-/// so two clashing blocks sit side by side.
+/// 0 or 1: which half of its column a clashing block takes in the grid.
 int clashSlot(Course c, List<Course> all) {
   final before = clashingWith(c, all).where((o) =>
   o.start < c.start ||
@@ -271,7 +292,10 @@ int clashSlot(Course c, List<Course> all) {
   return before.length % 2;
 }
 
-// Small helpers to show messages
+// ============================================================
+// SMALL HELPERS (messages, dialogs, error handling)
+// ============================================================
+
 void say(BuildContext context, String text) {
   final messenger = ScaffoldMessenger.of(context);
   messenger.hideCurrentSnackBar();
@@ -289,8 +313,60 @@ void sayWithUndo(BuildContext context, String text, VoidCallback onUndo) {
   );
 }
 
+Future<bool> askSure(BuildContext context, String title, String content) async {
+  final sure = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: Text(title),
+      content: Text(content),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(dialogContext, true),
+          child: const Text('Delete'),
+        ),
+      ],
+    ),
+  );
+  return sure == true;
+}
+
+/// Runs a Firestore action and shows a message if the server refuses.
+Future<void> run(BuildContext context, Future<void> Function() action) async {
+  try {
+    await action();
+  } on FirebaseException catch (e) {
+    if (context.mounted) {
+      say(context, 'Something went wrong (${e.code})');
+    }
+  }
+}
+
+/// The "loading" and "error" states of every screen that reads Firestore.
+/// Returns null when the data has arrived.
+Widget? loadingOrError(AsyncSnapshot snapshot, String what) {
+  if (snapshot.hasError) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Text(
+          'Could not load $what.\n${snapshot.error}',
+          textAlign: TextAlign.center,
+        ),
+      ),
+    );
+  }
+  if (!snapshot.hasData) {
+    return const Center(child: CircularProgressIndicator());
+  }
+  return null;
+}
+
 // ============================================================
-// SAMPLE DATA (so the app is never empty on its first run)
+// SAMPLE DATA: written once when a new account is created
 // ============================================================
 
 Course block(String name, String category, int day, String start, String end) {
@@ -313,7 +389,7 @@ List<Course> sampleCourses() {
 
     // ---------- Tuesday ----------
     block('INSY 8413 Big Data', 'Class', 1, '08:00', '11:00'),
-    block('Work at school', 'Work', 1, '11:00', '17:00'), // after class
+    block('Work at school', 'Work', 1, '11:00', '17:00'),
     block('Personal project', 'Project', 1, '18:00', '20:00'),
     block('Call my man', 'Together', 1, '21:30', '22:00'),
 
@@ -330,7 +406,7 @@ List<Course> sampleCourses() {
 
     // ---------- Friday ----------
     block('ENGL 8221 English', 'Class', 4, '08:30', '11:30'),
-    block('Work at school', 'Work', 4, '11:30', '13:30'), // between classes
+    block('Work at school', 'Work', 4, '11:30', '13:30'),
     block('INSY 8321 Data Structures', 'Class', 4, '13:30', '17:30'),
     block('Time with my man', 'Together', 4, '19:00', '21:00'),
 
@@ -342,8 +418,7 @@ List<Course> sampleCourses() {
     // ---------- Sunday ----------
     block('Personal project', 'Project', 6, '09:00', '12:00'),
     block('ME time', 'Me time', 6, '12:30', '14:00'),
-    // DEMO CLASH (the brief needs one): this overlaps ME time by 30 min.
-    // Edit ME time to end at 13:30 and the red disappears on both.
+    // DEMO CLASH (the brief needs one): overlaps ME time by 30 minutes.
     block('Budget and savings', 'Money', 6, '13:30', '14:30'),
     block('Exam preparation', 'Revision', 6, '15:30', '17:30'),
     block('ACCT 8224 Accounting II', 'Class', 6, '18:00', '21:00'),
@@ -351,8 +426,50 @@ List<Course> sampleCourses() {
   ];
 }
 
+Future<void> addSampleData() async {
+  final batch = FirebaseFirestore.instance.batch();
+
+  for (final c in sampleCourses()) {
+    batch.set(userCol('courses').doc(), c.toMap());
+  }
+
+  final base = DateTime.now().millisecondsSinceEpoch;
+
+  const taskTitles = [
+    'Revise my courses',
+    'Work on my personal project',
+    'Check my budget / save money',
+    'Check my body and mind',
+    'Take some ME time',
+    'Talk to my man before bed',
+  ];
+  for (int i = 0; i < taskTitles.length; i++) {
+    batch.set(
+      userCol('tasks').doc(),
+      Task(title: taskTitles[i], daily: true, order: base + i).toMap(),
+    );
+  }
+
+  const topics = [
+    ['Masoro: own card printer', 'How is Masoro going to get its own card printer?'],
+    ['Nursing emails', 'Write what exactly I must find out.'],
+    ['Admission emails', 'Write what exactly I must find out.'],
+    ['Gym information', 'Write what exactly I must find out.'],
+    ['Student cards', 'Write what exactly I must find out.'],
+  ];
+  for (int i = 0; i < topics.length; i++) {
+    batch.set(
+      userCol('research').doc(),
+      Research(topic: topics[i][0], detail: topics[i][1], order: base + i)
+          .toMap(),
+    );
+  }
+
+  await batch.commit();
+}
+
 // ============================================================
-// APP + BOTTOM NAVIGATION
+// APP + GATE
 // ============================================================
 
 class MyApp extends StatelessWidget {
@@ -364,10 +481,174 @@ class MyApp extends StatelessWidget {
       title: 'My Week',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
-      home: const HomeShell(),
+      home: const AuthGate(),
     );
   }
 }
+
+/// Shows the login screen, or the app when someone is logged in.
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        if (snapshot.data == null) {
+          return const LoginScreen();
+        }
+        return const HomeShell();
+      },
+    );
+  }
+}
+
+// ============================================================
+// LOGIN SCREEN
+// ============================================================
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _email = TextEditingController();
+  final _password = TextEditingController();
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _email.dispose();
+    _password.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit({required bool newAccount}) async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final auth = FirebaseAuth.instance;
+      if (newAccount) {
+        await auth.createUserWithEmailAndPassword(
+            email: _email.text.trim(), password: _password.text);
+        await addSampleData();
+      } else {
+        await auth.signInWithEmailAndPassword(
+            email: _email.text.trim(), password: _password.text);
+      }
+    } on FirebaseAuthException catch (e) {
+      setState(() => _error = _message(e.code));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  String _message(String code) {
+    switch (code) {
+      case 'email-already-in-use':
+        return 'An account with this email already exists. Log in instead.';
+      case 'invalid-credential':
+      case 'wrong-password':
+      case 'user-not-found':
+        return 'Wrong email or password.';
+      case 'weak-password':
+        return 'Choose a stronger password.';
+      case 'network-request-failed':
+        return 'No internet connection.';
+      default:
+        return 'Something went wrong ($code).';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Form(
+              key: _formKey,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'My Week',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 32),
+                  TextFormField(
+                    controller: _email,
+                    keyboardType: TextInputType.emailAddress,
+                    decoration: const InputDecoration(
+                      labelText: 'Email',
+                      border: OutlineInputBorder(),
+                    ),
+                    validator: (v) {
+                      final email = (v ?? '').trim();
+                      if (email.isEmpty) return 'Enter your email';
+                      if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+                          .hasMatch(email)) {
+                        return 'Enter a valid email, like aline@gmail.com';
+                      }
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 16),
+                  TextFormField(
+                    controller: _password,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Password',
+                      border: OutlineInputBorder(),
+                    ),
+                    validator: (v) =>
+                    (v ?? '').length < 6 ? 'At least 6 characters' : null,
+                  ),
+                  const SizedBox(height: 16),
+                  if (_error != null)
+                    Text(_error!, style: const TextStyle(color: Colors.red)),
+                  const SizedBox(height: 16),
+                  FilledButton(
+                    onPressed: _busy ? null : () => _submit(newAccount: false),
+                    child: const Text('Log in'),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton(
+                    onPressed: _busy ? null : () => _submit(newAccount: true),
+                    child: const Text('Create account'),
+                  ),
+                  if (_busy)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 16),
+                      child: Center(child: CircularProgressIndicator()),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// BOTTOM NAVIGATION
+// ============================================================
 
 class HomeShell extends StatefulWidget {
   const HomeShell({super.key});
@@ -381,7 +662,6 @@ class _HomeShellState extends State<HomeShell> {
 
   @override
   Widget build(BuildContext context) {
-    // IndexedStack keeps each tab alive, so nothing is lost when you switch.
     return Scaffold(
       body: IndexedStack(
         index: tab,
@@ -421,74 +701,41 @@ class WeekScreen extends StatefulWidget {
 }
 
 class _WeekScreenState extends State<WeekScreen> {
-  final List<Course> courses = sampleCourses();
-  int selectedDay = DateTime.now().weekday - 1; // Monday is 1 in Dart
+  // The live stream from Firestore, created once. The server sorts by start.
+  late final Stream<QuerySnapshot<Map<String, dynamic>>> coursesStream =
+  userCol('courses').orderBy('start').snapshots();
+
+  List<Course> latest = []; // the last list received, for the + button
+  int selectedDay = DateTime.now().weekday - 1;
   bool gridView = false;
 
-  @override
-  void initState() {
-    super.initState();
-    loadCourses();
-  }
-
-  Future<void> saveCourses() {
-    return saveList('courses', courses.map((c) => c.toJson()).toList());
-  }
-
-  Future<void> loadCourses() async {
-    final saved = await readList('courses');
-    if (saved == null || !mounted) return; // first time: keep the sample data
-    setState(() {
-      courses.clear();
-      courses.addAll(saved.map(Course.fromJson));
-    });
-  }
-
-  /// Opens the add/edit screen. existing == null means "add".
   void openCourse(Course? existing) {
     Navigator.push<dynamic>(
       context,
       MaterialPageRoute(
         builder: (context) => CourseScreen(
           course: existing,
-          all: courses,
+          all: latest,
           initialDay: selectedDay,
         ),
       ),
     ).then((result) {
-      if (result == null || !mounted) return; // back arrow pressed
+      if (!mounted || result is! Map) return;
 
-      if (result == 'delete') {
-        final removed = existing!;
-        final position = courses.indexOf(removed);
+      if (result['day'] is int) {
         setState(() {
-          courses.remove(removed);
+          selectedDay = result['day'] as int;
         });
-        saveCourses();
-        sayWithUndo(context, '${removed.name} deleted', () {
-          setState(() {
-            courses.insert(position, removed);
-          });
-          saveCourses();
-        });
-        return;
       }
-
-      if (result is Course) {
-        bool trimmed = false;
-        setState(() {
-          if (existing == null) {
-            courses.add(result);
-          }
-          if (result.category == 'Class') {
-            trimmed = makeRoomForClass(result, courses);
-          }
-          selectedDay = result.day;
+      if (result['trimmed'] == true) {
+        say(context, 'Work was shortened around your class');
+      }
+      final deleted = result['deleted'];
+      if (deleted is Course) {
+        sayWithUndo(context, '${deleted.name} deleted', () {
+          // Undo = write the same data back with the same id
+          userCol('courses').doc(deleted.id).set(deleted.toMap());
         });
-        saveCourses();
-        if (trimmed) {
-          say(context, 'Work was shortened around your class');
-        }
       }
     });
   }
@@ -508,29 +755,57 @@ class _WeekScreenState extends State<WeekScreen> {
               });
             },
           ),
+          IconButton(
+            icon: const Icon(Icons.logout),
+            tooltip: 'Log out',
+            onPressed: () => FirebaseAuth.instance.signOut(),
+          ),
         ],
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: () => openCourse(null),
         child: const Icon(Icons.add),
       ),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: Text(
-              'Week class time: ${formatDuration(classMinutes(courses))}',
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-            ),
-          ),
-          Expanded(child: gridView ? buildGrid() : buildList()),
-        ],
+      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+        stream: coursesStream,
+        builder: (context, snapshot) {
+          final problem = loadingOrError(snapshot, 'your week');
+          if (problem != null) return problem;
+
+          final courses = snapshot.data!.docs.map(Course.fromDoc).toList();
+          latest = courses;
+
+          if (courses.isEmpty) {
+            return const Center(
+              child: Text(
+                'Your week is empty.\nTap + to add your first block.',
+                textAlign: TextAlign.center,
+              ),
+            );
+          }
+
+          return Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: Text(
+                  'Week class time: ${formatDuration(classMinutes(courses))}',
+                  style: const TextStyle(
+                      fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+              ),
+              Expanded(
+                child: gridView ? buildGrid(courses) : buildList(courses),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
 
   // ---------------- LIST VIEW ----------------
-  Widget buildList() {
+  Widget buildList(List<Course> courses) {
     final todays = coursesForDay(selectedDay, courses);
     final dayName = dayNames[selectedDay];
     final hasClass = todays.any((c) => c.category == 'Class');
@@ -623,7 +898,7 @@ class _WeekScreenState extends State<WeekScreen> {
   }
 
   // ---------------- GRID VIEW ----------------
-  Widget buildGrid() {
+  Widget buildGrid(List<Course> courses) {
     const startHour = 7;
     const endHour = 23;
     const hourHeight = 48.0;
@@ -633,7 +908,6 @@ class _WeekScreenState extends State<WeekScreen> {
 
     return Column(
       children: [
-        // Legend: what each colour means
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 8),
           child: Wrap(
@@ -659,7 +933,6 @@ class _WeekScreenState extends State<WeekScreen> {
 
               return Column(
                 children: [
-                  // Day names row
                   Row(
                     children: [
                       const SizedBox(width: timeColWidth),
@@ -681,7 +954,6 @@ class _WeekScreenState extends State<WeekScreen> {
                         ),
                     ],
                   ),
-                  // The scrollable grid
                   Expanded(
                     child: SingleChildScrollView(
                       padding: const EdgeInsets.only(bottom: 80),
@@ -689,7 +961,6 @@ class _WeekScreenState extends State<WeekScreen> {
                         height: totalHeight,
                         child: Stack(
                           children: [
-                            // hour lines + hour labels
                             for (int h = startHour; h < endHour; h++)
                               Positioned(
                                 top: (h - startHour) * hourHeight,
@@ -720,7 +991,6 @@ class _WeekScreenState extends State<WeekScreen> {
                                   ],
                                 ),
                               ),
-                            // vertical lines between days
                             for (int d = 0; d <= 7; d++)
                               Positioned(
                                 left: timeColWidth + d * colWidth,
@@ -729,7 +999,6 @@ class _WeekScreenState extends State<WeekScreen> {
                                 width: 1,
                                 child: Container(color: Colors.grey.shade300),
                               ),
-                            // the blocks
                             ...courses.map<Widget>((c) {
                               final s = c.start
                                   .clamp(startHour * 60, endHour * 60)
@@ -739,14 +1008,14 @@ class _WeekScreenState extends State<WeekScreen> {
                                   .toInt();
                               if (e <= s) return const SizedBox.shrink();
 
-                              final hasClash = clashingWith(c, courses).isNotEmpty;
+                              final hasClash =
+                                  clashingWith(c, courses).isNotEmpty;
                               final color =
                                   categoryColors[c.category] ?? Colors.grey;
                               final textColor = color.computeLuminance() > 0.5
                                   ? Colors.black
                                   : Colors.white;
 
-                              // clashing blocks share the column (half each)
                               final slot = hasClash ? clashSlot(c, courses) : 0;
                               final width =
                               hasClash ? colWidth / 2 - 1 : colWidth - 2;
@@ -768,7 +1037,8 @@ class _WeekScreenState extends State<WeekScreen> {
                                       color: color,
                                       borderRadius: BorderRadius.circular(4),
                                       border: hasClash
-                                          ? Border.all(color: Colors.red, width: 2)
+                                          ? Border.all(
+                                          color: Colors.red, width: 2)
                                           : null,
                                     ),
                                     child: ClipRect(
@@ -825,6 +1095,7 @@ class _CourseScreenState extends State<CourseScreen> {
   final endController = TextEditingController();
   int day = 0;
   String category = 'Class';
+  bool saving = false;
 
   @override
   void initState() {
@@ -849,12 +1120,11 @@ class _CourseScreenState extends State<CourseScreen> {
     super.dispose();
   }
 
-  void save() {
+  Future<void> save() async {
     final name = nameController.text.trim();
     final start = parseTime(startController.text);
     final end = parseTime(endController.text);
 
-    // Every input is checked first. A refusal changes nothing.
     if (name.isEmpty) {
       say(context, 'Write the name first');
       return;
@@ -872,10 +1142,10 @@ class _CourseScreenState extends State<CourseScreen> {
       return;
     }
 
-    // Work never overlaps a class: when there is class, you do not work.
+    // Work never overlaps a class
     if (category == 'Work') {
       final hit = widget.all.where((c) =>
-      c != widget.course &&
+      c.id != widget.course?.id &&
           c.category == 'Class' &&
           c.day == day &&
           start < c.end &&
@@ -887,41 +1157,59 @@ class _CourseScreenState extends State<CourseScreen> {
       }
     }
 
-    // Edit: change the same object. Add: make a new one.
-    final result = widget.course ??
-        Course(name: name, day: day, start: start, end: end, category: category);
-    result.name = name;
-    result.day = day;
-    result.start = start;
-    result.end = end;
-    result.category = category;
+    setState(() {
+      saving = true;
+    });
 
-    Navigator.pop(context, result);
+    final block = Course(
+      id: widget.course?.id ?? '',
+      name: name,
+      day: day,
+      start: start,
+      end: end,
+      category: category,
+    );
+
+    bool trimmed = false;
+    try {
+      final col = userCol('courses');
+      if (widget.course == null) {
+        await col.add(block.toMap());
+      } else {
+        await col.doc(widget.course!.id).update(block.toMap());
+      }
+      if (category == 'Class') {
+        trimmed = await makeRoomForClass(block, widget.all);
+      }
+    } on FirebaseException catch (e) {
+      if (mounted) {
+        setState(() {
+          saving = false;
+        });
+        say(context, 'Could not save (${e.code})');
+      }
+      return;
+    }
+
+    if (mounted) {
+      Navigator.pop(context, {'trimmed': trimmed, 'day': day});
+    }
   }
 
-  void confirmDelete() {
-    showDialog(
-      context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          title: const Text('Delete this block?'),
-          content: Text(widget.course!.name),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () {
-                Navigator.pop(dialogContext); // close the dialog
-                Navigator.pop(context, 'delete'); // go back with "delete"
-              },
-              child: const Text('Delete'),
-            ),
-          ],
-        );
-      },
-    );
+  Future<void> deleteIt() async {
+    final course = widget.course!;
+    final sure = await askSure(context, 'Delete this block?', course.name);
+    if (!sure || !mounted) return;
+
+    try {
+      await userCol('courses').doc(course.id).delete();
+    } on FirebaseException catch (e) {
+      if (mounted) say(context, 'Could not delete (${e.code})');
+      return;
+    }
+    if (mounted) {
+      Navigator.pop(context, {'deleted': course});
+    }
   }
 
   @override
@@ -936,7 +1224,7 @@ class _CourseScreenState extends State<CourseScreen> {
             IconButton(
               tooltip: 'Delete',
               icon: const Icon(Icons.delete),
-              onPressed: confirmDelete,
+              onPressed: deleteIt,
             ),
         ],
       ),
@@ -1012,7 +1300,10 @@ class _CourseScreenState extends State<CourseScreen> {
             ],
           ),
           const SizedBox(height: 24),
-          FilledButton(onPressed: save, child: const Text('Save')),
+          FilledButton(
+            onPressed: saving ? null : save,
+            child: Text(saving ? 'Saving...' : 'Save'),
+          ),
         ],
       ),
     );
@@ -1020,7 +1311,7 @@ class _CourseScreenState extends State<CourseScreen> {
 }
 
 // ============================================================
-// SCREEN 3: TODAY'S TASKS (daily checklist)
+// SCREEN 3: TODAY'S TASKS (daily checklist, saved in Firestore)
 // ============================================================
 
 class TasksScreen extends StatefulWidget {
@@ -1031,35 +1322,12 @@ class TasksScreen extends StatefulWidget {
 }
 
 class _TasksScreenState extends State<TasksScreen> {
-  final List<Task> tasks = [
-    Task(title: 'Revise my courses', daily: true),
-    Task(title: 'Work on my personal project', daily: true),
-    Task(title: 'Check my budget / save money', daily: true),
-    Task(title: 'Check my body and mind', daily: true),
-    Task(title: 'Take some ME time', daily: true),
-    Task(title: 'Talk to my man before bed', daily: true),
-  ];
+  late final Stream<QuerySnapshot<Map<String, dynamic>>> tasksStream =
+  userCol('tasks').snapshots();
+
+  List<Task> latest = [];
   final controller = TextEditingController();
   bool repeatDaily = false;
-
-  @override
-  void initState() {
-    super.initState();
-    loadTasks();
-  }
-
-  Future<void> saveTasks() {
-    return saveList('tasks', tasks.map((t) => t.toJson()).toList());
-  }
-
-  Future<void> loadTasks() async {
-    final saved = await readList('tasks');
-    if (saved == null || !mounted) return; // first time: keep the sample tasks
-    setState(() {
-      tasks.clear();
-      tasks.addAll(saved.map(Task.fromJson));
-    });
-  }
 
   @override
   void dispose() {
@@ -1067,110 +1335,143 @@ class _TasksScreenState extends State<TasksScreen> {
     super.dispose();
   }
 
-  void addTask() {
+  Future<void> addTask() async {
     final title = controller.text.trim();
     if (title.isEmpty) {
       say(context, 'Write the task first');
       return;
     }
-    if (tasks.any((t) => t.title.toLowerCase() == title.toLowerCase())) {
+    if (latest.any((t) => t.title.toLowerCase() == title.toLowerCase())) {
       say(context, '"$title" is already on your list');
       return;
     }
-    setState(() {
-      tasks.add(Task(title: title, daily: repeatDaily));
-    });
-    saveTasks();
     controller.clear();
+    await run(
+      context,
+          () => userCol('tasks').add(Task(
+        title: title,
+        daily: repeatDaily,
+        order: DateTime.now().millisecondsSinceEpoch,
+      ).toMap()),
+    );
+  }
+
+  Future<void> toggle(Task task, bool done) async {
+    await run(
+      context,
+          () => userCol('tasks')
+          .doc(task.id)
+          .update({'doneDate': done ? todayKey() : null}),
+    );
+  }
+
+  Future<void> deleteTask(Task task) async {
+    final sure = await askSure(context, 'Delete this task?', task.title);
+    if (!sure || !mounted) return;
+    await run(context, () => userCol('tasks').doc(task.id).delete());
+    if (!mounted) return;
+    sayWithUndo(context, '"${task.title}" deleted', () {
+      userCol('tasks').doc(task.id).set(task.toMap());
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    final today = todayKey();
     final dayName = dayNames[DateTime.now().weekday - 1];
-
-    // Daily tasks always show. One-time tasks show until they are done,
-    // and stay for the rest of the day they were ticked.
-    final shown = tasks
-        .where((t) => t.daily || t.doneDate == null || t.doneDate == today)
-        .toList();
-    final doneCount = shown.where((t) => t.doneDate == today).length;
-    final double progress = shown.isEmpty ? 0.0 : doneCount / shown.length;
 
     return Scaffold(
       appBar: AppBar(title: Text('Today · $dayName')),
       body: Column(
         children: [
-          const KigaliWeatherTile(),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '$doneCount of ${shown.length} done',
-                  style: const TextStyle(
-                      fontSize: 20, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 8),
-                LinearProgressIndicator(value: progress, minHeight: 12),
-                if (shown.isNotEmpty && doneCount == shown.length)
-                  const Padding(
-                    padding: EdgeInsets.only(top: 8),
-                    child: Text('All done today. Rest well!'),
-                  ),
-              ],
-            ),
-          ),
           Expanded(
-            child: shown.isEmpty
-                ? const Center(child: Text('No tasks for today. Add one below.'))
-                : ListView.builder(
-              itemCount: shown.length,
-              itemBuilder: (context, index) {
-                final task = shown[index];
-                final done = task.doneDate == today;
+            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: tasksStream,
+              builder: (context, snapshot) {
+                final problem = loadingOrError(snapshot, 'your tasks');
+                if (problem != null) return problem;
 
-                return Dismissible(
-                  key: ObjectKey(task),
-                  direction: DismissDirection.endToStart,
-                  background: Container(
-                    color: Colors.red.shade200,
-                    alignment: Alignment.centerRight,
-                    padding: const EdgeInsets.only(right: 20),
-                    child: const Icon(Icons.delete),
-                  ),
-                  onDismissed: (_) {
-                    final position = tasks.indexOf(task);
-                    setState(() {
-                      tasks.remove(task);
-                    });
-                    saveTasks();
-                    sayWithUndo(context, '"${task.title}" deleted', () {
-                      setState(() {
-                        tasks.insert(position, task);
-                      });
-                      saveTasks();
-                    });
-                  },
-                  child: CheckboxListTile(
-                    value: done,
-                    onChanged: (value) {
-                      setState(() {
-                        task.doneDate = (value ?? false) ? today : null;
-                      });
-                      saveTasks();
-                    },
-                    title: Text(
-                      task.title,
-                      style: TextStyle(
-                        decoration:
-                        done ? TextDecoration.lineThrough : null,
+                final tasks = snapshot.data!.docs.map(Task.fromDoc).toList();
+                tasks.sort((a, b) => a.order.compareTo(b.order));
+                latest = tasks;
+
+                final today = todayKey();
+                // Daily tasks always show. One-time tasks show until done,
+                // and stay for the rest of the day they were ticked.
+                final shown = tasks
+                    .where((t) =>
+                t.daily || t.doneDate == null || t.doneDate == today)
+                    .toList();
+                final doneCount =
+                    shown.where((t) => t.doneDate == today).length;
+                final double progress =
+                shown.isEmpty ? 0.0 : doneCount / shown.length;
+
+                return Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '$doneCount of ${shown.length} done',
+                            style: const TextStyle(
+                                fontSize: 20, fontWeight: FontWeight.bold),
+                          ),
+                          const SizedBox(height: 8),
+                          LinearProgressIndicator(
+                              value: progress, minHeight: 12),
+                          if (shown.isNotEmpty && doneCount == shown.length)
+                            const Padding(
+                              padding: EdgeInsets.only(top: 8),
+                              child: Text('All done today. Rest well!'),
+                            ),
+                          const Padding(
+                            padding: EdgeInsets.only(top: 8),
+                            child: Text(
+                              'Tap to tick. Long press to delete.',
+                              style: TextStyle(fontSize: 12),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                    subtitle: task.daily ? const Text('Every day') : null,
-                    secondary: task.daily ? const Icon(Icons.repeat) : null,
-                  ),
+                    Expanded(
+                      child: shown.isEmpty
+                          ? const Center(
+                        child: Text('No tasks for today. Add one below.'),
+                      )
+                          : ListView.builder(
+                        itemCount: shown.length,
+                        itemBuilder: (context, index) {
+                          final task = shown[index];
+                          final done = task.doneDate == today;
+
+                          return ListTile(
+                            leading: Checkbox(
+                              value: done,
+                              onChanged: (v) => toggle(task, v ?? false),
+                            ),
+                            title: Text(
+                              task.title,
+                              style: TextStyle(
+                                decoration: done
+                                    ? TextDecoration.lineThrough
+                                    : null,
+                              ),
+                            ),
+                            subtitle:
+                            task.daily ? const Text('Every day') : null,
+                            trailing: task.daily
+                                ? const Icon(Icons.repeat)
+                                : null,
+                            onTap: () => toggle(task, !done),
+                            onLongPress: () => deleteTask(task),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
                 );
               },
             ),
@@ -1199,7 +1500,10 @@ class _TasksScreenState extends State<TasksScreen> {
                     });
                   },
                 ),
-                IconButton(onPressed: addTask, icon: const Icon(Icons.add_circle)),
+                IconButton(
+                  onPressed: addTask,
+                  icon: const Icon(Icons.add_circle),
+                ),
               ],
             ),
           ),
@@ -1210,7 +1514,7 @@ class _TasksScreenState extends State<TasksScreen> {
 }
 
 // ============================================================
-// SCREEN 4: RESEARCH BOARD (what I still have to find out)
+// SCREEN 4: RESEARCH BOARD (saved in Firestore)
 // ============================================================
 
 class ResearchScreen extends StatefulWidget {
@@ -1221,50 +1525,13 @@ class ResearchScreen extends StatefulWidget {
 }
 
 class _ResearchScreenState extends State<ResearchScreen> {
-  final List<Research> items = [
-    Research(
-      topic: 'Masoro: own card printer',
-      detail: 'How is Masoro going to get its own card printer?',
-    ),
-    Research(
-      topic: 'Nursing emails',
-      detail: 'Write what exactly I must find out.',
-    ),
-    Research(
-      topic: 'Admission emails',
-      detail: 'Write what exactly I must find out.',
-    ),
-    Research(
-      topic: 'Gym information',
-      detail: 'Write what exactly I must find out.',
-    ),
-    Research(
-      topic: 'Student cards',
-      detail: 'Write what exactly I must find out.',
-    ),
-  ];
+  late final Stream<QuerySnapshot<Map<String, dynamic>>> researchStream =
+  userCol('research').snapshots();
+
+  List<Research> latest = [];
   final topicController = TextEditingController();
   final detailController = TextEditingController();
   String filter = 'Open'; // Open, All or Done
-
-  @override
-  void initState() {
-    super.initState();
-    loadItems();
-  }
-
-  Future<void> saveItems() {
-    return saveList('research', items.map((i) => i.toJson()).toList());
-  }
-
-  Future<void> loadItems() async {
-    final saved = await readList('research');
-    if (saved == null || !mounted) return; // first time: keep the sample items
-    setState(() {
-      items.clear();
-      items.addAll(saved.map(Research.fromJson));
-    });
-  }
 
   @override
   void dispose() {
@@ -1279,135 +1546,146 @@ class _ResearchScreenState extends State<ResearchScreen> {
     return item.status != 'Done'; // Open
   }
 
-  void addItem() {
+  Future<void> addItem() async {
     final topic = topicController.text.trim();
     final detail = detailController.text.trim();
     if (topic.isEmpty) {
       say(context, 'Write the topic first');
       return;
     }
-    if (items.any((i) => i.topic.toLowerCase() == topic.toLowerCase())) {
+    if (latest.any((i) => i.topic.toLowerCase() == topic.toLowerCase())) {
       say(context, '"$topic" is already on the board');
       return;
     }
-    setState(() {
-      items.add(Research(
-        topic: topic,
-        detail: detail.isEmpty ? 'Write what exactly I must find out.' : detail,
-      ));
-    });
-    saveItems();
     topicController.clear();
     detailController.clear();
+    await run(
+      context,
+          () => userCol('research').add(Research(
+        topic: topic,
+        detail: detail.isEmpty ? 'Write what exactly I must find out.' : detail,
+        order: DateTime.now().millisecondsSinceEpoch,
+      ).toMap()),
+    );
+  }
+
+  Future<void> nextStatus(Research item) async {
+    final next = statuses[(statuses.indexOf(item.status) + 1) % statuses.length];
+    await run(
+      context,
+          () => userCol('research').doc(item.id).update({'status': next}),
+    );
+  }
+
+  Future<void> deleteItem(Research item) async {
+    final sure = await askSure(context, 'Delete this item?', item.topic);
+    if (!sure || !mounted) return;
+    await run(context, () => userCol('research').doc(item.id).delete());
+    if (!mounted) return;
+    sayWithUndo(context, '"${item.topic}" deleted', () {
+      userCol('research').doc(item.id).set(item.toMap());
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    // Built in status order, never changing the real list.
-    final shown = [
-      for (final s in statuses) ...items.where((i) => i.status == s && matchesFilter(i)),
-    ];
-    final openCount = items.where((i) => i.status != 'Done').length;
-
     return Scaffold(
       appBar: AppBar(title: const Text('To research')),
       body: Column(
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    '$openCount still open',
-                    style: const TextStyle(
-                        fontSize: 20, fontWeight: FontWeight.bold),
-                  ),
-                ),
-                for (final f in ['Open', 'All', 'Done'])
-                  Padding(
-                    padding: const EdgeInsets.only(left: 4),
-                    child: ChoiceChip(
-                      label: Text(f),
-                      selected: filter == f,
-                      onSelected: (_) {
-                        setState(() {
-                          filter = f;
-                        });
-                      },
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 16),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                'Tap an item to move it to the next status. Swipe left to delete.',
-                style: TextStyle(fontSize: 12),
-              ),
-            ),
-          ),
           Expanded(
-            child: shown.isEmpty
-                ? Center(
-              child: Text(
-                filter == 'Open'
-                    ? 'Nothing left to find out. Well done!'
-                    : 'Nothing here yet.',
-              ),
-            )
-                : ListView.builder(
-              itemCount: shown.length,
-              itemBuilder: (context, index) {
-                final item = shown[index];
+            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: researchStream,
+              builder: (context, snapshot) {
+                final problem = loadingOrError(snapshot, 'your research list');
+                if (problem != null) return problem;
 
-                return Dismissible(
-                  key: ObjectKey(item),
-                  direction: DismissDirection.endToStart,
-                  background: Container(
-                    color: Colors.red.shade200,
-                    alignment: Alignment.centerRight,
-                    padding: const EdgeInsets.only(right: 20),
-                    child: const Icon(Icons.delete),
-                  ),
-                  onDismissed: (_) {
-                    final position = items.indexOf(item);
-                    setState(() {
-                      items.remove(item);
-                    });
-                    saveItems();
-                    sayWithUndo(context, '"${item.topic}" deleted', () {
-                      setState(() {
-                        items.insert(position, item);
-                      });
-                      saveItems();
-                    });
-                  },
-                  child: Card(
-                    child: ListTile(
-                      title: Text(
-                        item.topic,
-                        style: const TextStyle(fontWeight: FontWeight.bold),
+                final items =
+                snapshot.data!.docs.map(Research.fromDoc).toList();
+                items.sort((a, b) => a.order.compareTo(b.order));
+                latest = items;
+
+                // Shown in status order: To find out, Asked, Done
+                final shown = [
+                  for (final s in statuses)
+                    ...items.where((i) => i.status == s && matchesFilter(i)),
+                ];
+                final openCount =
+                    items.where((i) => i.status != 'Done').length;
+
+                return Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '$openCount still open',
+                              style: const TextStyle(
+                                  fontSize: 20, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                          for (final f in ['Open', 'All', 'Done'])
+                            Padding(
+                              padding: const EdgeInsets.only(left: 4),
+                              child: ChoiceChip(
+                                label: Text(f),
+                                selected: filter == f,
+                                onSelected: (_) {
+                                  setState(() {
+                                    filter = f;
+                                  });
+                                },
+                              ),
+                            ),
+                        ],
                       ),
-                      subtitle: Text(item.detail),
-                      trailing: Chip(
-                        label: Text(item.status),
-                        backgroundColor: statusColors[item.status],
-                      ),
-                      onTap: () {
-                        setState(() {
-                          final next =
-                              (statuses.indexOf(item.status) + 1) %
-                                  statuses.length;
-                          item.status = statuses[next];
-                        });
-                        saveItems();
-                      },
                     ),
-                  ),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 16),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          'Tap an item to move it to the next status. Long press to delete.',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: shown.isEmpty
+                          ? Center(
+                        child: Text(
+                          filter == 'Open'
+                              ? 'Nothing left to find out. Well done!'
+                              : 'Nothing here yet.',
+                        ),
+                      )
+                          : ListView.builder(
+                        itemCount: shown.length,
+                        itemBuilder: (context, index) {
+                          final item = shown[index];
+
+                          return Card(
+                            child: ListTile(
+                              title: Text(
+                                item.topic,
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.bold),
+                              ),
+                              subtitle: Text(item.detail),
+                              trailing: Chip(
+                                label: Text(item.status),
+                                backgroundColor: statusColors[item.status],
+                              ),
+                              onTap: () => nextStatus(item),
+                              onLongPress: () => deleteItem(item),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
                 );
               },
             ),
@@ -1447,125 +1725,6 @@ class _ResearchScreenState extends State<ResearchScreen> {
           ),
         ],
       ),
-    );
-  }
-}
-// ============================================================
-// LIVE WEATHER FROM AN API (loading, error and data states)
-// ============================================================
-
-String weatherWords(int code) {
-  if (code == 0) return 'Clear sky';
-  if (code <= 2) return 'Partly cloudy';
-  if (code == 3) return 'Cloudy';
-  if (code == 45 || code == 48) return 'Fog';
-  if (code >= 51 && code <= 57) return 'Drizzle';
-  if (code >= 61 && code <= 67) return 'Rain';
-  if (code >= 80 && code <= 82) return 'Rain showers';
-  if (code >= 95) return 'Thunderstorm';
-  return 'Unknown';
-}
-
-IconData weatherIcon(int code) {
-  if (code == 0) return Icons.wb_sunny;
-  if (code <= 3) return Icons.cloud;
-  if (code == 45 || code == 48) return Icons.foggy;
-  if (code >= 95) return Icons.thunderstorm;
-  if (code >= 51) return Icons.water_drop;
-  return Icons.help_outline;
-}
-
-class KigaliWeatherTile extends StatefulWidget {
-  const KigaliWeatherTile({super.key});
-
-  @override
-  State<KigaliWeatherTile> createState() => _KigaliWeatherTileState();
-}
-
-class _KigaliWeatherTileState extends State<KigaliWeatherTile> {
-  bool loading = true; // state 1: loading
-  String? error; // state 2: error
-  double? temperature; // state 3: data
-  int? code;
-
-  @override
-  void initState() {
-    super.initState();
-    load();
-  }
-
-  Future<void> load() async {
-    setState(() {
-      loading = true;
-      error = null;
-    });
-    try {
-      final url = Uri.parse(
-        'https://api.open-meteo.com/v1/forecast'
-            '?latitude=-1.9441&longitude=30.0619'
-            '&current=temperature_2m,weather_code'
-            '&timezone=Africa%2FKigali',
-      );
-      final response = await http.get(url);
-      if (response.statusCode != 200) {
-        throw Exception('The weather server answered ${response.statusCode}');
-      }
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final current = data['current'] as Map<String, dynamic>;
-      if (!mounted) return;
-      setState(() {
-        temperature = (current['temperature_2m'] as num).toDouble();
-        code = (current['weather_code'] as num).toInt();
-        loading = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        loading = false;
-        error = 'Could not load the weather.';
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    Widget content;
-    if (loading) {
-      content = const Row(
-        children: [
-          SizedBox(
-            width: 20,
-            height: 20,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
-          SizedBox(width: 12),
-          Text('Loading Kigali weather...'),
-        ],
-      );
-    } else if (error != null) {
-      content = Row(
-        children: [
-          const Icon(Icons.wifi_off),
-          const SizedBox(width: 12),
-          Expanded(child: Text(error!)),
-          TextButton(onPressed: load, child: const Text('Retry')),
-        ],
-      );
-    } else {
-      content = Row(
-        children: [
-          Icon(weatherIcon(code!)),
-          const SizedBox(width: 12),
-          Text(
-            'Kigali now: ${temperature!.round()}°C, ${weatherWords(code!)}',
-          ),
-        ],
-      );
-    }
-
-    return Card(
-      margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-      child: Padding(padding: const EdgeInsets.all(12), child: content),
     );
   }
 }
